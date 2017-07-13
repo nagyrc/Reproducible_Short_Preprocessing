@@ -6,18 +6,7 @@
 library(tidyverse)
 library(scales)
 library(gridExtra)
-library(gpclib)
-library(rgeos)
-library(maptools)
-library(RColorBrewer)
-library(classInt)
-library(ggmap)
-library(data.table)
-library(rgdal)
-library(bit64)
-library(viridis)
 library(grid)
-library(mblm)
 library(raster)
 library(sf)
 library(lubridate)
@@ -26,63 +15,53 @@ library(doParallel)
 library(foreach) 
 
 # Import Shapefiles from Geodatabase -------------------------------------------------------
+
+dir <- "/Users/NateM/Dropbox/Professional/RScripts/"
+
+# An Albers equal area projection for the lower 48
 proj <- "+proj=aea +lat_1=20 +lat_2=60 +lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0 "
 
-require(rgdal)
-# The input file geodatabase
-fgdb = "/Users/NateM/Dropbox/Professional/RScripts/Short_Update/data/Short_9215/Data/FPA_FOD_20170508.gdb"
-
-# # List all feature classes in a file geodatabase
-subset(ogrDrivers(), grepl("GDB", name))
-fc_list = ogrListLayers(fgdb)
-print(fc_list)
-
 # Read the feature class
-shrt_fire = readOGR(dsn=fgdb,layer="Fires")
-
-shrt_conus <- subset(shrt_fire, STATE != "AK" & STATE != "PR" & STATE != "HI" & FIRE_SIZE >= 0.01)
-shrt_conus <- SpatialPointsDataFrame(shrt_conus, shrt_conus@data)
-shrt_conus <- spTransform(shrt_conus, CRS(proj))
-shrt_conus$id <- row.names(shrt_conus)
-shrt_df <- as.data.frame(shrt_conus)
-
-shrt_df <- shrt_df%>%
-  dplyr::select(FPA_ID, ICS_209_INCIDENT_NUMBER, ICS_209_NAME, MTBS_ID, MTBS_FIRE_NAME,
-                FIRE_YEAR, DISCOVERY_DOY, STAT_CAUSE_DESCR, FIRE_SIZE, STATE) %>%
+shrt_fire = st_read(dsn = paste0(dir, "Short_Update/data/Short_9215/Data/FPA_FOD_20170508.gdb"),
+                    layer = "Fires", quiet= TRUE) %>%
+  subset(., STATE != "AK" & STATE != "PR" & STATE != "HI" & FIRE_SIZE >= 0.01) %>%
+  select(FPA_ID, ICS_209_INCIDENT_NUMBER, ICS_209_NAME, MTBS_ID, MTBS_FIRE_NAME,
+         FIRE_YEAR, DISCOVERY_DOY, STAT_CAUSE_DESCR, FIRE_SIZE, STATE) %>%
   mutate(IGNITION = ifelse(STAT_CAUSE_DESCR == "Lightning", "Lightning", "Human"))
 
 #Import the USA States layer
-usa = "/Users/NateM/Dropbox/Professional/RScripts/Short_Update/data/cb_2016_us_state_20m"
-usa_shp <- st_read(dsn = usa, layer = "cb_2016_us_state_20m", quiet= TRUE) %>%
+usa_shp <- st_read(dsn = paste0(dir,  "Short_Update/data/cb_2016_us_state_20m"),
+                   layer = "cb_2016_us_state_20m", quiet= TRUE) %>%
   st_transform(., proj) %>%
   subset(., NAME != "Alaska" &
            NAME != "Hawaii" &
            NAME != "Puerto Rico") %>%
   mutate(area_m2 = as.numeric(st_area(geometry)),
-         area_km2 = area_m2/1000000,
-         group = 1)
+         StArea_km2 = area_m2/1000000,
+         group = 1) %>%
+  st_simplify(., preserveTopology = TRUE)
+plot(usa_shp[5])
 
 # Dissolve to the USA Boundary
-conus <- st_union(usa_shp, group, by_feature = TRUE) 
+conus <- usa_shp %>%
+  group_by(group) %>%
+  st_union()
+plot(conus)
 
 # Import the Level 3 Ecoregions
-eco = "/Users/NateM/Dropbox/Professional/RScripts/Short_Update/data/us_eco_l3"
+eco = paste0(dir, "Short_Update/data/us_eco_l3")
 ecoreg <- st_read(dsn = eco, layer = "us_eco_l3", quiet= TRUE) %>%
-  st_transform(., proj)
-plot(ecoreg)
+  st_transform(., proj) %>%
+  st_simplify(., preserveTopology = TRUE, dTolerance = 1000) %>%
+  mutate(area_m2 = as.numeric(st_area(geometry)),
+         EcoArea_km2 = area_m2/1000000)
+plot(ecoreg[2])
 
+# Intersects the region 
+state_eco <- st_intersection(usa_shp, ecoreg) %>%
+  dplyr::select(STUSPS, NAME, StArea_km2, US_L3CODE, US_L3NAME, NA_L2NAME, NA_L1CODE, NA_L1NAME, geometry)
 
-fgdb = "/Volumes/LaCie LR/Data/anthro/KeyFiles.gdb"
-subset(ogrDrivers(), grepl("GDB", name))
-fc_list = ogrListLayers(fgdb)
-print(fc_list)
-
-StEcoReg = readOGR(dsn=fgdb,layer="State_Ecoregion_laea_wRegion")
-simple_StEcoReg = rgeos::gSimplify(StEcoReg, tol = 10, topologyPreserve = TRUE)
-(object.size(simple_StEcoReg)/object.size(StEcoReg))[1]
-StEcoReg <- SpatialPolygonsDataFrame(simple_StEcoReg, StEcoReg@data)
-StEcoReg <- spTransform(StEcoReg, CRS(proj))
-StEcoReg$id <- row.names(StEcoReg)
+ign_state_eco <- st_intersection(shrt_fire, state_eco)
 
 
 # Import Wind -------------------------------------------------------------
@@ -110,7 +89,7 @@ netcdf_to_tif_numabove95 <- function(file, mask, outfolder) {
   proj <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
   rbrck1 <- brick(tvar, crs= proj)
   extent(rbrck1) <- c(-124.772163391113, -67.06383005778, 25.0626894632975, 49.3960227966309) #from metadata in Arc or IDRISI, when you open .nc file
-
+  
   nc1 <- nc_open(wind_dl[2])
   nc_att <- attributes(nc1$var)$names
   ncvar <- ncvar_get(nc1, nc_att)
@@ -118,11 +97,11 @@ netcdf_to_tif_numabove95 <- function(file, mask, outfolder) {
   proj <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
   rbrck2 <- brick(tvar, crs= proj)
   extent(rbrck2) <- c(-124.772163391113, -67.06383005778, 25.0626894632975, 49.3960227966309) #from metadata in Arc or IDRISI, when you open .nc file
-
+  
   mst_stack <- stack(rbrck1, rbrck2)
   
   res <- stackApply(mst_stack, indices = month_seq, fun = mean)
-
+  
   names(res) <- paste(var, unique(month(monthly_seq)),
                       sep = "_")
   masked_res <- mask(res, mask)
@@ -143,6 +122,17 @@ ffwi_95 <- foreach(i = 1:length(ffwi_dl)) %dopar% {
 stopCluster(cl)
 
 # Create Fishnets ---------------------------------------------------------
+# make an object the size and shape of the output you want
+globe_bb <- matrix(c(-2236857, -1691466, 2127027,  1328720), nrow=2) %>%
+  list() %>% 
+  st_polygon() %>% 
+  st_sfc(., crs = 4326)
+
+# generate grid of 20 x 10 tiles (200 in total, each 18 x 18 degrees)
+globe_grid_18x18 <- st_make_grid(globe_bb, n = c(20, 10), 
+                                 crs = 4326, what = 'polygons') %>%
+  st_sf('geometry' = ., data.frame('ID' = 1:length(.)))
+
 
 
 r10k <- raster(extent(matrix( c(-2236857, -1691466, 2127027,  1328720), nrow=2)), 
