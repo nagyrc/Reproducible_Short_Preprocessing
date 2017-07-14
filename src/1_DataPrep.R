@@ -4,9 +4,7 @@
 
 # Libraries ---------------------------------------------------------------
 library(tidyverse)
-library(scales)
 library(gridExtra)
-library(grid)
 library(raster)
 library(sf)
 library(lubridate)
@@ -17,20 +15,22 @@ library(foreach)
 # Import Shapefiles from Geodatabase -------------------------------------------------------
 
 dir <- "/Users/NateM/Dropbox/Professional/RScripts/"
+dir_proc <- "data/processed/"
 
 # An Albers equal area projection for the lower 48
 proj <- "+proj=aea +lat_1=20 +lat_2=60 +lat_0=40 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0 "
 
 # Read the feature class
-shrt_fire = st_read(dsn = paste0(dir, "Short_Update/data/Short_9215/Data/FPA_FOD_20170508.gdb"),
+shrt_fire = st_read(dsn = paste0(dir, "Short_Update/data/fire/Short_9215/Data/FPA_FOD_20170508.gdb"),
                     layer = "Fires", quiet= TRUE) %>%
-  subset(., STATE != "AK" & STATE != "PR" & STATE != "HI" & FIRE_SIZE >= 0.01) %>%
-  select(FPA_ID, ICS_209_INCIDENT_NUMBER, ICS_209_NAME, MTBS_ID, MTBS_FIRE_NAME,
+  st_transform(., proj) %>%
+  filter(STATE != "AK" & STATE != "PR" & STATE != "HI" & FIRE_SIZE >= 0.01) %>%
+  dplyr::select(FPA_ID, ICS_209_INCIDENT_NUMBER, ICS_209_NAME, MTBS_ID, MTBS_FIRE_NAME,
          FIRE_YEAR, DISCOVERY_DOY, STAT_CAUSE_DESCR, FIRE_SIZE, STATE) %>%
   mutate(IGNITION = ifelse(STAT_CAUSE_DESCR == "Lightning", "Lightning", "Human"))
 
 #Import the USA States layer
-usa_shp <- st_read(dsn = paste0(dir,  "Short_Update/data/cb_2016_us_state_20m"),
+usa_shp <- st_read(dsn = paste0(dir,  "Short_Update/data/bounds/state"),
                    layer = "cb_2016_us_state_20m", quiet= TRUE) %>%
   st_transform(., proj) %>%
   subset(., NAME != "Alaska" &
@@ -49,7 +49,7 @@ conus <- usa_shp %>%
 plot(conus)
 
 # Import the Level 3 Ecoregions
-eco = paste0(dir, "Short_Update/data/us_eco_l3")
+eco = paste0(dir, "Short_Update/data/bounds/us_eco_l3")
 ecoreg <- st_read(dsn = eco, layer = "us_eco_l3", quiet= TRUE) %>%
   st_transform(., proj) %>%
   st_simplify(., preserveTopology = TRUE, dTolerance = 1000) %>%
@@ -66,8 +66,8 @@ ign_state_eco <- st_intersection(shrt_fire, state_eco)
 
 # Import Wind -------------------------------------------------------------
 
-wind_dl <- list.files("/Users/NateM/Dropbox/Professional/RScripts/Mietkiewicz_etal_HumanIgnProb/data/raw/historical_gridmet/", pattern = "nc", full.names = TRUE)
-
+wind_dl <- list.files(paste0(dir, "data/climate/windspd/"), pattern = "nc", full.names = TRUE)
+                      
 netcdf_to_tif_numabove95 <- function(file, mask, outfolder) {
   file_split <- wind_dl %>%
     basename %>%
@@ -85,10 +85,35 @@ netcdf_to_tif_numabove95 <- function(file, mask, outfolder) {
   nc1 <- nc_open(wind_dl[1])
   nc_att <- attributes(nc1$var)$names
   ncvar <- ncvar_get(nc1, nc_att)
-  tvar <- aperm(ncvar, c(1,2,3))
+  # remove unneeded object for memory conservation
+  rm(ncvar)
+  gc()
+  tvar <- aperm(ncvar, c(3,2,1))
+  # remove unneeded object for memory conservation
+  rm(tvar)
+  gc()
   proj <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
-  rbrck1 <- brick(tvar, crs= proj)
-  extent(rbrck1) <- c(-124.772163391113, -67.06383005778, 25.0626894632975, 49.3960227966309) #from metadata in Arc or IDRISI, when you open .nc file
+  rbrck <- brick(tvar, crs= proj)
+  extent(rbrck) <- c(-124.772163391113, -67.06383005778, 25.0626894632975, 49.3960227966309) #from metadata in Arc or IDRISI, when you open .nc file
+  
+  n_layers <- length(names(rbrck))
+  lag <- 12
+  lagged_vals <- list()
+  counter <- 1
+  pb <- txtProgressBar(max = n_layers, style = 3)
+  for (i in 1:n_layers) {
+    if (i > lag) {
+      lagged_vals[[counter]] <- sum(subset(r, (i - lag):(i - 1)))
+      names(lagged_vals)[counter] <- paste("timestep", i, "lag", lag, sep = "_")
+      counter <- counter + 1
+    }
+    setTxtProgressBar(pb, i)
+  }
+  # remove unneeded object for memory conservation
+  rm(rbrck)
+  gc()
+  # convert the list of lagged summaries to a raster stack
+  lagged_vals <- stack(lagged_vals)
   
   nc1 <- nc_open(wind_dl[2])
   nc_att <- attributes(nc1$var)$names
@@ -105,9 +130,9 @@ netcdf_to_tif_numabove95 <- function(file, mask, outfolder) {
   names(res) <- paste(var, unique(month(monthly_seq)),
                       sep = "_")
   masked_res <- mask(res, mask)
-  dir.create(paste0(dirc, dir_proc, var), showWarnings = FALSE)
-  dir.create(paste0(dirc, dir_proc, var, "/", outfolder), showWarnings = FALSE)
-  out <- paste0(dirc, dir_proc, var,  "/", outfolder, "/")
+  dir.create(paste0(dir, dir_proc, var), showWarnings = FALSE)
+  dir.create(paste0(dir, dir_proc, var, "/", outfolder), showWarnings = FALSE)
+  out <- paste0(dir, dir_proc, var,  "/", outfolder, "/")
   writeRaster(masked_res, filename = paste0(out,names(masked_res)),
               format = "GTiff", bylayer=TRUE, overwrite = TRUE)
   return(paste("File", names(masked_res), "written"))
@@ -126,7 +151,7 @@ stopCluster(cl)
 globe_bb <- matrix(c(-2236857, -1691466, 2127027,  1328720), nrow=2) %>%
   list() %>% 
   st_polygon() %>% 
-  st_sfc(., crs = 4326)
+  st_sfc(., crs = proj)
 
 # generate grid of 20 x 10 tiles (200 in total, each 18 x 18 degrees)
 globe_grid_18x18 <- st_make_grid(globe_bb, n = c(20, 10), 
